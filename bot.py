@@ -9,9 +9,6 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 DOCTOR_ID = 262491197
 
-WORK_START = 8
-WORK_END = 21
-
 patient_memory = {}
 daily_requests = []
 BLACKLIST = set()
@@ -71,14 +68,35 @@ def is_spam(text):
     return any(word in text.lower() for word in spam_words)
 
 async def send_daily_report(app):
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+
     if not daily_requests:
-        report = "📊 Звіт: сьогодні звернень не було."
-    else:
-        report = f"📊 Звіт — {len(daily_requests)} звернень:\n\n"
-        for i, req in enumerate(daily_requests, 1):
-            report += f"{i}. {req}\n"
+        await app.bot.send_message(
+            chat_id=DOCTOR_ID,
+            text=f"📊 Звіт {now}\nЗвернень не було."
+        )
+        return
+
+    report = f"📊 Звіт {now} — {len(daily_requests)} звернень:\n\n"
+    for i, req in enumerate(daily_requests, 1):
+        report += f"{i}. {req}\n"
     await app.bot.send_message(chat_id=DOCTOR_ID, text=report)
+
+    for chat_id, data in patient_memory.items():
+        if not data.get("history"):
+            continue
+        name = data.get("name") or str(chat_id)
+        dialog = f"💬 Діалог з {name}:\n\n"
+        for msg in data["history"]:
+            role = "👤" if msg["role"] == "user" else "🤖"
+            dialog += f"{role}: {msg['content']}\n\n"
+        chunks = [dialog[i:i+4000] for i in range(0, len(dialog), 4000)]
+        for chunk in chunks:
+            await app.bot.send_message(chat_id=DOCTOR_ID, text=chunk)
+
     daily_requests.clear()
+    for data in patient_memory.values():
+        data["history"] = []
 
 async def schedule_reports(app):
     while True:
@@ -139,6 +157,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = response.content[0].text
     patient_memory[chat_id]["history"].append({"role": "assistant", "content": reply})
 
+    if not patient_memory[chat_id].get("name"):
+        words = text.split()
+        for i, word in enumerate(words):
+            if word.lower() in ["мене", "мене", "я", "меня"] and i + 1 < len(words):
+                patient_memory[chat_id]["name"] = words[i + 1].capitalize()
+                break
+
     keyboard = [[
         InlineKeyboardButton("📅 Записатись", callback_data="record"),
         InlineKeyboardButton("📍 Адреса", callback_data="address"),
@@ -147,7 +172,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(reply, reply_markup=reply_markup)
 
-    daily_requests.append(f"👤 {patient_memory[chat_id].get('name') or chat_id}: {text[:50]}")
+    name = patient_memory[chat_id].get("name") or str(chat_id)
+    daily_requests.append(f"👤 {name}: {text[:60]}")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
