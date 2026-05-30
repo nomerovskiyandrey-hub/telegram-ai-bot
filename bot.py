@@ -69,19 +69,13 @@ def is_spam(text):
 
 async def send_daily_report(app):
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
-
     if not daily_requests:
-        await app.bot.send_message(
-            chat_id=DOCTOR_ID,
-            text=f"📊 Звіт {now}\nЗвернень не було."
-        )
+        await app.bot.send_message(chat_id=DOCTOR_ID, text=f"📊 Звіт {now}\nЗвернень не було.")
         return
-
     report = f"📊 Звіт {now} — {len(daily_requests)} звернень:\n\n"
     for i, req in enumerate(daily_requests, 1):
         report += f"{i}. {req}\n"
     await app.bot.send_message(chat_id=DOCTOR_ID, text=report)
-
     for chat_id, data in patient_memory.items():
         if not data.get("history"):
             continue
@@ -93,7 +87,6 @@ async def send_daily_report(app):
         chunks = [dialog[i:i+4000] for i in range(0, len(dialog), 4000)]
         for chunk in chunks:
             await app.bot.send_message(chat_id=DOCTOR_ID, text=chunk)
-
     daily_requests.clear()
     for data in patient_memory.values():
         data["history"] = []
@@ -105,37 +98,14 @@ async def schedule_reports(app):
             await send_daily_report(app)
         await asyncio.sleep(60)
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id in BLACKLIST:
-        return
-
-    name = patient_memory.get(chat_id, {}).get("name", "")
-    greeting = f"{name}, д" if name else "Д"
-
-    await update.message.reply_text(
-        f"{greeting}якую отримали ваші знімки. Андрій Ігорович розгляне і зв'яжеться з вами найближчим часом.\n\nЯкщо терміново — зателефонуйте: 0673283276"
-    )
-
-    daily_requests.append(f"📷 Фото від {name or chat_id}")
-    await context.bot.send_message(
-        chat_id=DOCTOR_ID,
-        text=f"📷 Пацієнт {name or chat_id} надіслав фото/рентген"
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    chat_id = update.effective_chat.id
-    text = update.message.text
+async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, message):
+    chat_id = message.chat.id
+    text = message.text
 
     if chat_id == DOCTOR_ID:
         return
-
     if chat_id in BLACKLIST:
         return
-
     if is_spam(text):
         BLACKLIST.add(chat_id)
         return
@@ -176,15 +146,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(reply, reply_markup=reply_markup)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=reply,
+        reply_markup=reply_markup,
+        business_connection_id=getattr(message, 'business_connection_id', None)
+    )
 
     name = patient_memory[chat_id].get("name") or str(chat_id)
     daily_requests.append(f"👤 {name}: {text[:60]}")
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message or update.business_message
+    if not message or not message.text:
+        return
+    await process_message(update, context, message)
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message or update.business_message
+    if not message:
+        return
+    chat_id = message.chat.id
+    if chat_id in BLACKLIST:
+        return
+    name = patient_memory.get(chat_id, {}).get("name", "")
+    greeting = f"{name}, д" if name else "Д"
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"{greeting}якую отримали ваші знімки. Андрій Ігорович розгляне і зв'яжеться з вами найближчим часом.\n\nЯкщо терміново — зателефонуйте: 0673283276",
+        business_connection_id=getattr(message, 'business_connection_id', None)
+    )
+    daily_requests.append(f"📷 Фото від {name or chat_id}")
+    await context.bot.send_message(
+        chat_id=DOCTOR_ID,
+        text=f"📷 Пацієнт {name or chat_id} надіслав фото/рентген"
+    )
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.data == "record":
         await query.message.reply_text(
             "Для запису зателефонуйте: 0673283276\nАбо напишіть зручний час — я передам лікарю."
@@ -202,7 +202,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=["message", "business_message", "callback_query"])
 
 if __name__ == "__main__":
     main()
