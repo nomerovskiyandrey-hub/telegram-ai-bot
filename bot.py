@@ -1,9 +1,9 @@
 import os
 import asyncio
-from datetime import datetime, time
+from datetime import datetime
 import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler, CallbackQueryHandler
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -52,19 +52,15 @@ SYSTEM_PROMPT = """Ти — AI-асистент лікаря ортопеда-т
 ## Правила
 - Не ставиш діагнози
 - Не призначаєш лікування
-- Якщо пацієнт пише "терміново", "дуже боляче", "невідкладно" — одразу кажи що передаєш лікарю
+- Якщо пацієнт пише "терміново", "срочно", "дуже боляче", "очень больно" — одразу кажи що передаєш лікарю
 - Складні медичні питання: "Андрій Ігорович розгляне ваш випадок особисто. Залиште номер телефону або зателефонуйте: 0673283276"
 - Якщо питають про рентген/знімки: просити надіслати на 0673283276
 - Якщо питають про операцію в державній лікарні: згадати бюджетну програму (держава безоплатно надає імпланти)
 - Якщо пацієнт надіслав фото/рентген: подякуй і скажи що лікар розгляне і зв'яжеться
 - Завжди в кінці пропонуй записатися на консультацію
-- Якщо повідомлення схоже на спам або рекламу — ігноруй
+- Якщо повідомлення схоже на спам або рекламу — ігноруй і не відповідай
 - Запам'ятовуй ім'я пацієнта якщо він його назвав і звертайся по імені
 - Тон: теплий, професійний, без зайвих слів"""
-
-def is_working_hours():
-    now = datetime.now()
-    return WORK_START <= now.hour < WORK_END
 
 def is_urgent(text):
     urgent_words = ["терміново", "срочно", "дуже боляче", "очень больно", "невідкладно", "не можу ходити", "не могу ходить"]
@@ -78,7 +74,7 @@ async def send_daily_report(app):
     if not daily_requests:
         report = "📊 Звіт: сьогодні звернень не було."
     else:
-        report = f"📊 Звіт за день — {len(daily_requests)} звернень:\n\n"
+        report = f"📊 Звіт — {len(daily_requests)} звернень:\n\n"
         for i, req in enumerate(daily_requests, 1):
             report += f"{i}. {req}\n"
     await app.bot.send_message(chat_id=DOCTOR_ID, text=report)
@@ -87,24 +83,22 @@ async def send_daily_report(app):
 async def schedule_reports(app):
     while True:
         now = datetime.now()
-        report_times = [8, 20]
-        for hour in report_times:
-            if now.hour == hour and now.minute == 0:
-                await send_daily_report(app)
+        if now.hour in [8, 20] and now.minute == 0:
+            await send_daily_report(app)
         await asyncio.sleep(60)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id in BLACKLIST:
         return
-    
+
     name = patient_memory.get(chat_id, {}).get("name", "")
     greeting = f"{name}, д" if name else "Д"
-    
+
     await update.message.reply_text(
         f"{greeting}якую отримали ваші знімки. Андрій Ігорович розгляне і зв'яжеться з вами найближчим часом.\n\nЯкщо терміново — зателефонуйте: 0673283276"
     )
-    
+
     daily_requests.append(f"📷 Фото від {name or chat_id}")
     await context.bot.send_message(
         chat_id=DOCTOR_ID,
@@ -125,13 +119,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id not in patient_memory:
         patient_memory[chat_id] = {"name": "", "history": []}
 
-    if not is_working_hours():
-        await update.message.reply_text(
-            "Доброї ночі! Лікар зараз відпочиває. Ваше повідомлення збережено — відповімо з 8:00. Якщо терміново — телефонуйте: 0673283276"
-        )
-        daily_requests.append(f"💤 Нічне звернення від {chat_id}: {text[:50]}")
-        return
-
     if is_urgent(text):
         await context.bot.send_message(
             chat_id=DOCTOR_ID,
@@ -139,7 +126,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     patient_memory[chat_id]["history"].append({"role": "user", "content": text})
-    
     history = patient_memory[chat_id]["history"][-10:]
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -166,7 +152,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+
     if query.data == "record":
         await query.message.reply_text(
             "Для запису зателефонуйте: 0673283276\nАбо напишіть зручний час — я передам лікарю."
