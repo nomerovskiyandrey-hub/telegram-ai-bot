@@ -124,8 +124,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
     chat_id = update.effective_chat.id
     text = update.message.text
+
+    if chat_id == DOCTOR_ID:
+        return
 
     if chat_id in BLACKLIST:
         return
@@ -160,7 +166,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not patient_memory[chat_id].get("name"):
         words = text.split()
         for i, word in enumerate(words):
-            if word.lower() in ["мене", "мене", "я", "меня"] and i + 1 < len(words):
+            if word.lower() in ["мене", "я", "меня"] and i + 1 < len(words):
                 patient_memory[chat_id]["name"] = words[i + 1].capitalize()
                 break
 
@@ -196,7 +202,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
