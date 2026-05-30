@@ -52,7 +52,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     pending_messages[chat_id].append(text)
     
-    await asyncio.sleep(1200)  # 20 хвилин
+    await asyncio.sleep(2)  # 2 секунди
+
     
     if pending_messages.get(chat_id):
         messages_to_answer = pending_messages.pop(chat_id)
