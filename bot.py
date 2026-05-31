@@ -1,5 +1,7 @@
 import os
 import asyncio
+import sqlite3
+import json
 from datetime import datetime
 import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -9,87 +11,267 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 DOCTOR_ID = 262491197
 
-patient_memory = {}
-daily_requests = []
-BLACKLIST = set()
+flood_control = {}
+urgent_cooldown = {}
 
-SYSTEM_PROMPT = """Ти — AI-асистент лікаря ортопеда-травматолога Андрія Ігоровича Номеровського.
-Відповідай мовою пацієнта (українська або російська).
-Ніколи не представляйся як Claude або AI від Anthropic.
-Представляйся: "Асистент лікаря Андрія Ігоровича Номеровського"
+# ===== БАЗА ДАНИХ =====
+def init_db():
+    conn = sqlite3.connect("/tmp/bot.db")
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS patients (
+        chat_id INTEGER PRIMARY KEY,
+        name TEXT DEFAULT '',
+        history TEXT DEFAULT '[]'
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS daily_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT,
+        created_at TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS blacklist (
+        chat_id INTEGER PRIMARY KEY
+    )""")
+    conn.commit()
+    conn.close()
 
-## Лікар
+def get_patient(chat_id):
+    conn = sqlite3.connect("/tmp/bot.db")
+    c = conn.cursor()
+    c.execute("SELECT name, history FROM patients WHERE chat_id=?", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"name": row[0], "history": json.loads(row[1])}
+    return {"name": "", "history": []}
+
+def save_patient(chat_id, data):
+    conn = sqlite3.connect("/tmp/bot.db")
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO patients (chat_id, name, history) VALUES (?,?,?)",
+              (chat_id, data["name"], json.dumps(data["history"])))
+    conn.commit()
+    conn.close()
+
+def add_request(text):
+    conn = sqlite3.connect("/tmp/bot.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO daily_requests (text, created_at) VALUES (?,?)",
+              (text, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    conn.close()
+
+def get_requests():
+    conn = sqlite3.connect("/tmp/bot.db")
+    c = conn.cursor()
+    c.execute("SELECT text FROM daily_requests ORDER BY id")
+    rows = [r[0] for r in c.fetchall()]
+    conn.close()
+    return rows
+
+def clear_requests():
+    conn = sqlite3.connect("/tmp/bot.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM daily_requests")
+    conn.commit()
+    conn.close()
+
+def is_blacklisted(chat_id):
+    conn = sqlite3.connect("/tmp/bot.db")
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM blacklist WHERE chat_id=?", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
+
+def add_blacklist(chat_id):
+    conn = sqlite3.connect("/tmp/bot.db")
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO blacklist (chat_id) VALUES (?)", (chat_id,))
+    conn.commit()
+    conn.close()
+
+# ===== ПРОМПТ =====
+SYSTEM_PROMPT = """Ти — розумний персональний асистент лікаря ортопеда-травматолога Андрія Ігоровича Номеровського.
+
+## ГОЛОВНЕ ПРАВИЛО
+Спочатку мовчки класифікуй хто пише (не показуй класифікацію) і відповідай відповідно:
+
+### 🏥 ПАЦІЄНТ (медичне питання, запис, симптоми, операція):
+- Представляйся: "Асистент лікаря Андрія Ігоровича Номеровського"
+- Медичний тон, тепло, по суті
+- Завжди пропонуй записатись
+
+### 👥 ДРУГ/ЗНАЙОМИЙ (неформальне спілкування, особисті теми):
+- НЕ представляйся як асистент
+- Відповідай невимушено від імені Андрія
+- "Привіт! Зараз зайнятий, передам що писав"
+
+### 👔 КОЛЕГА (медична термінологія, робочі питання):
+- Коротко, професійно
+- "Андрій на операції, звільниться після 13:00"
+
+## ТИПОВИЙ РОЗКЛАД АНДРІЯ
+Пн-Пт:
+- 08:30-13:00 — робота в лікарні (операції, прийом)
+- 13:00-15:00 — вільний або особисті справи
+- 15:00-19:00 — приватна клініка або зустрічі
+- після 21:00 — вдома, не турбувати
+
+Субота-Неділя: вихідні, відповідає рідко
+
+## ЛІКАР
 Андрій Ігорович Номеровський — ортопед-травматолог, м. Одеса.
-Спеціалізація: ендопротезування суглобів, травматологія.
+Спеціалізація: ендопротезування кульшового та колінного суглобів, артроскопія, лікування переломів та травм.
 
-## Де приймає
+## ДЕ ПРИЙМАЄ
 **МКЛ №11** (державна)
-вул. Нестеренка, 5а — Центр ортопедії та травматології, 8 корпус, 1 поверх, ліве крило, ординаторська
-Прийом: понеділок, середа, п'ятниця — перша половина дня
-Консультація: безкоштовно (потрібне електронне направлення від сімейного лікаря)
+вул. Нестеренка, 5а — 8 корпус, 1 поверх, ліве крило, ординаторська
+Прийом: пн, ср, пт — перша половина дня
+Консультація: безкоштовно (потрібне направлення від сімейного лікаря)
 
 **Клініка Onemed** (приватна)
 вул. Якова Бреуса, 26/2, Одеса
-Прийом: середа, п'ятниця — друга половина дня
-Ендопротезування кульшового суглобу: від 150 000 грн
+Прийом: ср, пт — друга половина дня
+Ендопротезування: від 150 000 грн
 
-## Запис
+## ЗАПИС
 Телефон: 0673283276
 Або через цей чат
 
-## Підготовка до операції
-Якщо пацієнт готується до операції, надішли список:
-- Загальний клінічний аналіз крові
-- Група крові
-- Коагулограма
-- ЕКГ (зробимо в лікарні)
-- Рентген легень
-- УЗД судин нижніх кінцівок (Ольга Олеговна: 0955817486)
+## ПІДГОТОВКА ДО ОПЕРАЦІЇ
 
-## Правила
+### Пам'ятка перед операцією:
+- Легка їжа в день перед операцією, останній прийом до 20:00
+- За 3-4 дні виключити: фрукти, овочі, соки, бобові, газовані напої, м'ясні та молочні продукти у великій кількості, хлібобулочні вироби
+- В день операції — їжа та напої заборонені
+- Очисна клізма увечері перед операцією (при необхідності)
+- Куріння в день операції заборонено
+- Зняти лак з нігтів, косметику, прикраси, годинник, знімні зубні протези
+- Душ напередодні або вранці перед операцією
+- Взяти з собою: халат або спортивний костюм, тапочки, туалетні приналежності, рушник, ложку, чашку
+- Планова операція не проводиться в дні місячних
+- Після операції може знадобитись бандаж, еластичні колготки — приміряти заздалегідь
+- Повідомити лікаря про будь-які зміни здоров'я напередодні (лихоманка, нежить, висипання)
+
+### Аналізи перед операцією:
+⚠️ Точний перелік — тільки після консультації з Андрієм Ігоровичем: 0673283276
+
+Орієнтовний список:
+- Загальний клінічний аналіз крові та сечі
+- Коагулограма, глюкоза, печінковий комплекс
+- Група крові
+- Обстеження на сифіліс, ВІЛ
+- R-обстеження суглобів
+- ЕХО/КС
+- Дуплексне сканування судин нижніх кінцівок
+- ФГДС
+- Обстеження на вірусні гепатити
+- Консультація суміжних фахівців
+- Висновок сімейного лікаря
+- Посів з носа, консультація стоматолога
+
+## РЕАБІЛІТАЦІЯ ПІСЛЯ ОПЕРАЦІЙ
+Важливо: не давай індивідуальних дозволів без огляду лікаря. Завжди уточнюй яка операція, дата, кінцівка. Формулюй як загальні орієнтири.
+
+### Після артроскопії колінного суглоба:
+- 1-3 день: спокій, лід 10-15 хв, підняте положення ноги
+- 3-7 день: легкі рухи, ізометрія квадрицепса
+- 2-4 тиждень: ЛФК, ходьба без перевантаження
+- Після пластики зв'язок режим значно обмеженіший
+
+### Після ендопротезування кульшового суглоба:
+- 1-7 день: ходьба з ходунками, профілактика тромбозів
+- 2-6 тижнів: поступове збільшення ходьби, ЛФК
+- Обмеження: не схрещувати ноги, не сідати дуже низько
+
+### Після ендопротезування колінного суглоба:
+- 1-7 день: рання ходьба з опорою, розгинання коліна
+- 2-6 тижнів: ЛФК, збільшення згинання
+- 6-12 тижнів: зміцнення м'язів
+
+### Після остеосинтезу перелому:
+- Навантаження тільки з дозволу лікаря
+- Контрольний рентген через 4-6 тижнів
+- Не знімати іммобілізацію без дозволу
+
+### Тривожні симптоми після операції:
+ЕКСТРЕНО (103 + повідом лікаря):
+- Задишка, біль у грудях
+- Різка кровотеча
+- Похолодання/оніміння кінцівки
+
+ТЕРМІНОВО (зв'язатись з лікарем 0673283276):
+- Температура вище 37.5°C
+- Виділення з рани
+- Наростаючий біль або набряк
+- Почервоніння навколо шва
+
+## ПРАВИЛА
 - Не ставиш діагнози
 - Не призначаєш лікування
-- Якщо пацієнт пише "терміново", "срочно", "дуже боляче", "очень больно" — одразу кажи що передаєш лікарю
-- Складні медичні питання: "Андрій Ігорович розгляне ваш випадок особисто. Залиште номер телефону або зателефонуйте: 0673283276"
-- Якщо питають про рентген/знімки: просити надіслати на 0673283276
-- Якщо питають про операцію в державній лікарні: згадати бюджетну програму (держава безоплатно надає імпланти)
-- Якщо пацієнт надіслав фото/рентген: подякуй і скажи що лікар розгляне і зв'яжеться
-- Завжди в кінці пропонуй записатися на консультацію
-- Якщо повідомлення схоже на спам або рекламу — ігноруй і не відповідай
-- Запам'ятовуй ім'я пацієнта якщо він його назвав і звертайся по імені
-- Тон: теплий, професійний, без зайвих слів"""
+- Складні випадки: "Андрій Ігорович розгляне особисто. Телефон: 0673283276"
+- Спам або тільки емодзі — ігноруй
+- Мова відповіді = мова пацієнта (укр/рос)
+- Запам'ятовуй ім'я і звертайся по імені
+- Тон: теплий, природний, без зайвих слів"""
 
+# ===== УТИЛІТИ =====
 def is_urgent(text):
-    urgent_words = ["терміново", "срочно", "дуже боляче", "очень больно", "невідкладно", "не можу ходити", "не могу ходить"]
-    return any(word in text.lower() for word in urgent_words)
+    urgent_words = ["терміново", "срочно", "дуже боляче", "очень больно", "невідкладно", "не можу ходити", "не могу ходить", "швидка", "скорая"]
+    clean = text.lower().strip()
+    if len(clean) < 3:
+        return False
+    return any(word in clean for word in urgent_words)
 
 def is_spam(text):
-    spam_words = ["реклама", "купити", "продам", "казино", "заробіток", "крипто", "bitcoin", "заработок"]
+    spam_words = ["реклама", "купити", "продам", "казино", "заробіток", "крипто", "bitcoin", "заработок", "розіграш"]
     return any(word in text.lower() for word in spam_words)
 
+def is_flood(chat_id):
+    now = datetime.now().timestamp()
+    if chat_id not in flood_control:
+        flood_control[chat_id] = []
+    flood_control[chat_id] = [t for t in flood_control[chat_id] if now - t < 60]
+    flood_control[chat_id].append(now)
+    return len(flood_control[chat_id]) > 5
+
+def check_urgent_cooldown(chat_id):
+    now = datetime.now().timestamp()
+    last = urgent_cooldown.get(chat_id, 0)
+    if now - last < 600:
+        return True
+    urgent_cooldown[chat_id] = now
+    return False
+
+def is_only_emoji(text):
+    import unicodedata
+    for char in text.strip():
+        cat = unicodedata.category(char)
+        if cat not in ('So', 'Sm', 'Sk', 'Sc', 'Zs') and not char.isspace():
+            return False
+    return True
+
+async def get_contact_info(message):
+    user = getattr(message, 'from_user', None)
+    if not user:
+        return "контакт невідомий"
+    if user.username:
+        return f"@{user.username}"
+    name = " ".join(filter(None, [user.first_name, user.last_name]))
+    return f"{name or 'Telegram user'} | tg://user?id={user.id}"
+
+# ===== ЗВІТИ =====
 async def send_daily_report(app):
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
-    if not daily_requests:
+    requests = get_requests()
+    if not requests:
         await app.bot.send_message(chat_id=DOCTOR_ID, text=f"📊 Звіт {now}\nЗвернень не було.")
         return
-    report = f"📊 Звіт {now} — {len(daily_requests)} звернень:\n\n"
-    for i, req in enumerate(daily_requests, 1):
+    report = f"📊 Звіт {now} — {len(requests)} звернень:\n\n"
+    for i, req in enumerate(requests, 1):
         report += f"{i}. {req}\n"
-    await app.bot.send_message(chat_id=DOCTOR_ID, text=report)
-    for chat_id, data in patient_memory.items():
-        if not data.get("history"):
-            continue
-        name = data.get("name") or str(chat_id)
-        dialog = f"💬 Діалог з {name}:\n\n"
-        for msg in data["history"]:
-            role = "👤" if msg["role"] == "user" else "🤖"
-            dialog += f"{role}: {msg['content']}\n\n"
-        chunks = [dialog[i:i+4000] for i in range(0, len(dialog), 4000)]
-        for chunk in chunks:
-            await app.bot.send_message(chat_id=DOCTOR_ID, text=chunk)
-    daily_requests.clear()
-    for data in patient_memory.values():
-        data["history"] = []
+    await app.bot.send_message(chat_id=DOCTOR_ID, text=report[:4000])
+    clear_requests()
 
 async def schedule_reports(app):
     while True:
@@ -98,47 +280,62 @@ async def schedule_reports(app):
             await send_daily_report(app)
         await asyncio.sleep(60)
 
+# ===== ОБРОБКА ПОВІДОМЛЕНЬ =====
 async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, message):
     chat_id = message.chat.id
     text = message.text
 
     if chat_id == DOCTOR_ID:
         return
-    if chat_id in BLACKLIST:
+    if is_blacklisted(chat_id):
+        return
+    if is_only_emoji(text):
         return
     if is_spam(text):
-        BLACKLIST.add(chat_id)
+        add_blacklist(chat_id)
+        return
+    if is_flood(chat_id):
         return
 
-    if chat_id not in patient_memory:
-        patient_memory[chat_id] = {"name": "", "history": []}
+    patient = get_patient(chat_id)
 
-    if is_urgent(text):
+    if is_urgent(text) and not check_urgent_cooldown(chat_id):
+        contact = await get_contact_info(message)
+        name = patient.get('name') or 'Невідомий'
         await context.bot.send_message(
             chat_id=DOCTOR_ID,
-            text=f"🚨 ТЕРМІНОВО! Пацієнт {patient_memory[chat_id].get('name') or chat_id} пише: {text}"
+            text=f"🚨 ТЕРМІНОВО!\nПацієнт: {name}\nКонтакт: {contact}\nПише: {text}"
         )
 
-    patient_memory[chat_id]["history"].append({"role": "user", "content": text})
-    history = patient_memory[chat_id]["history"][-10:]
+    patient["history"].append({"role": "user", "content": text})
+    history = patient["history"][-10:]
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    response = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=1000,
-        system=SYSTEM_PROMPT,
-        messages=history
-    )
+    try:
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        response = await client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=history
+        )
+        reply = response.content[0].text
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=DOCTOR_ID,
+            text=f"⚠️ Помилка Claude для чату {chat_id}: {e}"
+        )
+        reply = "Дякую, повідомлення отримали. Андрій Ігорович перегляне і зв'яжеться з вами."
 
-    reply = response.content[0].text
-    patient_memory[chat_id]["history"].append({"role": "assistant", "content": reply})
+    patient["history"].append({"role": "assistant", "content": reply})
 
-    if not patient_memory[chat_id].get("name"):
+    if not patient.get("name"):
         words = text.split()
         for i, word in enumerate(words):
             if word.lower() in ["мене", "я", "меня"] and i + 1 < len(words):
-                patient_memory[chat_id]["name"] = words[i + 1].capitalize()
+                patient["name"] = words[i + 1].capitalize()
                 break
+
+    save_patient(chat_id, patient)
 
     keyboard = [[
         InlineKeyboardButton("📅 Записатись", callback_data="record"),
@@ -146,19 +343,23 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, me
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
+    business_id = getattr(message, 'business_connection_id', None)
     await context.bot.send_message(
         chat_id=chat_id,
         text=reply,
-        reply_markup=reply_markup,
-        business_connection_id=getattr(message, 'business_connection_id', None)
+        reply_markup=reply_markup if not business_id else None,
+        business_connection_id=business_id
     )
 
-    name = patient_memory[chat_id].get("name") or str(chat_id)
-    daily_requests.append(f"👤 {name}: {text[:60]}")
+    contact = await get_contact_info(message)
+    name = patient.get("name") or str(chat_id)
+    add_request(f"👤 {name} ({contact}): {text[:60]}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.business_message
     if not message or not message.text:
+        return
+    if message.from_user and message.from_user.is_bot:
         return
     await process_message(update, context, message)
 
@@ -167,20 +368,36 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message:
         return
     chat_id = message.chat.id
-    if chat_id in BLACKLIST:
+    if is_blacklisted(chat_id) or chat_id == DOCTOR_ID:
         return
-    name = patient_memory.get(chat_id, {}).get("name", "")
+
+    patient = get_patient(chat_id)
+    name = patient.get("name", "")
     greeting = f"{name}, д" if name else "Д"
+    business_id = getattr(message, 'business_connection_id', None)
+
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"{greeting}якую отримали ваші знімки. Андрій Ігорович розгляне і зв'яжеться з вами найближчим часом.\n\nЯкщо терміново — зателефонуйте: 0673283276",
-        business_connection_id=getattr(message, 'business_connection_id', None)
+        text=f"{greeting}якую отримали ваші знімки. Андрій Ігорович розгляне і зв'яжеться найближчим часом.\n\nЯкщо терміново — зателефонуйте: 0673283276",
+        business_connection_id=business_id
     )
-    daily_requests.append(f"📷 Фото від {name or chat_id}")
-    await context.bot.send_message(
-        chat_id=DOCTOR_ID,
-        text=f"📷 Пацієнт {name or chat_id} надіслав фото/рентген"
-    )
+
+    # Пересилаємо фото лікарю
+    try:
+        await context.bot.forward_message(
+            chat_id=DOCTOR_ID,
+            from_chat_id=chat_id,
+            message_id=message.message_id
+        )
+    except Exception:
+        contact = await get_contact_info(message)
+        await context.bot.send_message(
+            chat_id=DOCTOR_ID,
+            text=f"📷 {name or chat_id} ({contact}) надіслав фото"
+        )
+
+    contact = await get_contact_info(message)
+    add_request(f"📷 Фото від {name or chat_id} ({contact})")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -195,6 +412,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def post_init(app):
+    init_db()
     asyncio.create_task(schedule_reports(app))
 
 def main():
