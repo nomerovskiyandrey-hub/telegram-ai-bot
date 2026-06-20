@@ -289,14 +289,104 @@ async def send_daily_report(app):
     await app.bot.send_message(chat_id=DOCTOR_ID, text=report[:4000])
     clear_requests()
 
+# ─────────────────────────────────────────────
+# 🌅 УТРЕННЕЕ СООБЩЕНИЕ — 07:00 (только тебе)
+# ─────────────────────────────────────────────
+async def send_morning_question(app):
+    await app.bot.send_message(
+        chat_id=DOCTOR_ID,
+        text=(
+            "🌅 *Доброе утро, Андрей!*\n\n"
+            "Один вопрос на сегодня:\n\n"
+            "*Что сегодня важнее всего?*"
+        ),
+        parse_mode="Markdown"
+    )
+
+# ─────────────────────────────────────────────
+# 📋 ВЕЧЕРНИЙ ЧЕК-ИН — 19:00 (только тебе)
+# ─────────────────────────────────────────────
+async def send_evening_checkin(app):
+    await app.bot.send_message(
+        chat_id=DOCTOR_ID,
+        text=(
+            "📋 *Вечерний чек-ин*\n\n"
+            "Ответь на каждый пункт одной цифрой или словом:\n\n"
+            "😊 *Настрой сегодня?*\n"
+            "😩 Виснажений / 😐 Нормально / 😊 Добре / 💪 Вогонь\n\n"
+            "🧠 *Стресс?*\n"
+            "🟢 Спокій / 🟡 Помірний / 🟠 Напружено / 🔴 Перегрів\n\n"
+            "⚓ *3 якоря — виконано?*\n"
+            "🌅 Рух+вода+ціль — так/ні\n"
+            "💰 Фіксував витрати — так/ні\n"
+            "❤️ Тепла дія для дружини — так/ні\n\n"
+            "🏋️ *Тренування?*\n"
+            "❌ Не було / 🚶 Ходьба / 🏠 Вдома / 🌳 Вулиця\n\n"
+            "💸 *Витрати за день (₴):*\n\n"
+            "💰 *Дохід за день (₴):*\n\n"
+            "🦴 *Операції / пацієнти сьогодні:*\n\n"
+            "❤️ *Час з сім'єю (хв без телефону):*"
+        ),
+        parse_mode="Markdown"
+    )
+
+# ─────────────────────────────────────────────
+# 🌙 НОЧНОЙ ВОПРОС — 21:00 (только тебе)
+# ─────────────────────────────────────────────
+async def send_night_question(app):
+    await app.bot.send_message(
+        chat_id=DOCTOR_ID,
+        text=(
+            "🌙 *Добрый вечер!*\n\n"
+            "*Что сегодня было хорошего — даже маленькое?*"
+        ),
+        parse_mode="Markdown"
+    )
+
+# ─────────────────────────────────────────────
+# ⏰ ПЛАНИРОВЩИК — все события по времени
+# ─────────────────────────────────────────────
 async def schedule_reports(app):
     global last_report_key
     while True:
         now = datetime.now()
-        key = now.strftime("%Y-%m-%d %H")
-        if now.hour in [8, 20] and now.minute == 0 and last_report_key != key:
-            await send_daily_report(app)
-            last_report_key = key
+        date_str = now.strftime("%Y-%m-%d")
+
+        # 🌅 Утренний вопрос — 07:00
+        if now.hour == 7 and now.minute == 0:
+            key = f"{date_str}_morning"
+            if last_report_key != key:
+                await send_morning_question(app)
+                last_report_key = key
+
+        # 📊 Утренний отчёт по пациентам — 08:00
+        if now.hour == 8 and now.minute == 0:
+            key = f"{date_str}_report_morning"
+            if last_report_key != key:
+                await send_daily_report(app)
+                last_report_key = key
+
+        # 📋 Вечерний чек-ин по дневнику — 19:00
+        if now.hour == 19 and now.minute == 0:
+            key = f"{date_str}_checkin"
+            if last_report_key != key:
+                await send_evening_checkin(app)
+                last_report_key = key
+
+        # 📊 Вечерний отчёт по пациентам — 20:00
+        if now.hour == 20 and now.minute == 0:
+            key = f"{date_str}_report_evening"
+            if last_report_key != key:
+                await send_daily_report(app)
+                last_report_key = key
+
+        # 🌙 Ночной вопрос — 21:00
+        if now.hour == 21 and now.minute == 0:
+            key = f"{date_str}_night"
+            if last_report_key != key:
+                await send_night_question(app)
+                last_report_key = key
+
         await asyncio.sleep(30)
 
 async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, message):
