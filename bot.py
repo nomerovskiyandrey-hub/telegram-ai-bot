@@ -10,7 +10,7 @@ import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-KYIV_TZ = ZoneInfo("Europe/Kiev")
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
