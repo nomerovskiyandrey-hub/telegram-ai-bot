@@ -648,7 +648,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.business_message
     if not message or not message.text:
         return
-    if message.from_user and message.from_user.is_bot:
+    if not message.from_user:
+        return
+    if message.from_user.is_bot:
+        return
+    if message.from_user.id == context.bot.id:
         return
 
     chat_id = message.chat.id
