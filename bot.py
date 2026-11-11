@@ -8,7 +8,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CallbackQueryHandler, CommandHandler
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
@@ -47,6 +47,11 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS doctor_memory (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         memory TEXT DEFAULT ''
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS checkins (
+        date TEXT PRIMARY KEY,
+        state TEXT DEFAULT '{}',
+        done INTEGER DEFAULT 0
     )""")
     # Міграція: додати long_memory якщо не існує
     try:
@@ -438,24 +443,115 @@ async def send_morning_question(app):
         parse_mode="Markdown"
     )
 
+# ── ✅ Інтерактивний вечірній чек-ін (кнопки, редагується на місці) ──
+
+CHECK_ITEMS = [
+    ("move", "🏃 Рух 10 хв"),
+    ("water", "💧 Вода зранку"),
+    ("spend", "💸 Витрати записав"),
+    ("story", "📱 Сторис вийшла"),
+    ("wife", "❤️ Тепла дія дружині"),
+    ("misha", "📖 Міша: 15 хв / книжка"),
+    ("sviat", "👶 Час зі Святославом"),
+]
+MOOD = [("1", "😩"), ("2", "😐"), ("3", "🙂"), ("4", "🔥")]
+STRESS = [("1", "🧊 спокій"), ("2", "🌤 помірно"), ("3", "⚡ напруга"), ("4", "🌋 перегрів")]
+OPS = [("0", "0"), ("1", "1"), ("2", "2"), ("3", "3+")]
+
+def _today():
+    return datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
+
+def get_checkin(date):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT state, done FROM checkins WHERE date=?", (date,)).fetchone()
+    conn.close()
+    return (json.loads(row[0]), bool(row[1])) if row else ({}, False)
+
+def save_checkin(date, state, done=False):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR REPLACE INTO checkins (date, state, done) VALUES (?, ?, ?)",
+                 (date, json.dumps(state, ensure_ascii=False), int(done)))
+    conn.commit()
+    conn.close()
+
+def checkin_streak():
+    conn = sqlite3.connect(DB_PATH)
+    dates = {r[0] for r in conn.execute("SELECT date FROM checkins WHERE done=1")}
+    conn.close()
+    streak, day = 0, datetime.now(KYIV_TZ).date()
+    from datetime import timedelta
+    while day.isoformat() in dates:
+        streak += 1
+        day -= timedelta(days=1)
+    return streak
+
+def checkin_keyboard(date, st):
+    rows, pair = [], []
+    for key, label in CHECK_ITEMS:
+        mark = "✅" if st.get(key) else "⬜"
+        pair.append(InlineKeyboardButton(f"{mark} {label}", callback_data=f"ci:{date}:t:{key}"))
+        if len(pair) == 2:
+            rows.append(pair); pair = []
+    if pair:
+        rows.append(pair)
+    def radio(field, opts, title):
+        rows.append([InlineKeyboardButton(title, callback_data="ci:noop")])
+        rows.append([InlineKeyboardButton(("● " if st.get(field) == v else "") + lbl,
+                                          callback_data=f"ci:{date}:{field}:{v}") for v, lbl in opts])
+    radio("mood", MOOD, "— Настрій —")
+    radio("stress", STRESS, "— Стрес —")
+    radio("ops", OPS, "— Операцій сьогодні —")
+    rows.append([InlineKeyboardButton("💾 Готово", callback_data=f"ci:{date}:done:1")])
+    return InlineKeyboardMarkup(rows)
+
+def checkin_text(date, st):
+    done = sum(1 for k, _ in CHECK_ITEMS if st.get(k))
+    return f"📋 Підсумок дня {date[8:]}.{date[5:7]} — тапай, що було.\nВиконано: {done}/{len(CHECK_ITEMS)}"
+
 async def send_evening_checkin(app):
-    await app.bot.send_message(
-        chat_id=DOCTOR_ID,
-        text=(
-            "📋 Підсумок дня. По-швидкому:\n\n"
-            "😊 *Як ти?* _(виснажений / нормально / добре / вогонь)_\n"
-            "🧠 *Стрес?* _(спокій / помірний / напружено / перегрів)_\n\n"
-            "✅ *Чекліст:*\n"
-            "— Рух + вода вранці → так/ні\n"
-            "— Витрати фіксував → так/ні\n"
-            "— Побув із сім'єю без телефону → так/ні\n\n"
-            "🦴 *Пацієнтів / операцій:*\n"
-            "💰 *Дохід (₴):*\n"
-            "💸 *Витрати (₴):*\n"
-            "⚖️ Баланс = _порахую сам_"
-        ),
-        parse_mode="Markdown"
-    )
+    date = _today()
+    st, _ = get_checkin(date)
+    await app.bot.send_message(chat_id=DOCTOR_ID, text=checkin_text(date, st),
+                               reply_markup=checkin_keyboard(date, st))
+
+async def handle_checkin_callback(query):
+    parts = query.data.split(":")
+    if len(parts) < 4:
+        await query.answer()
+        return
+    _, date, field, val = parts
+    st, _ = get_checkin(date)
+    if field == "t":
+        st[val] = not st.get(val)
+    elif field == "done":
+        missing = [n for f, n in (("mood", "настрій"), ("stress", "стрес")) if f not in st]
+        if missing:
+            await query.answer("Ще: " + ", ".join(missing), show_alert=False)
+            return
+        save_checkin(date, st, done=True)
+        done = sum(1 for k, _ in CHECK_ITEMS if st.get(k))
+        lines = [f"{'✅' if st.get(k) else '❌'} {lbl}" for k, lbl in CHECK_ITEMS]
+        mood = dict(MOOD).get(st.get("mood"), "")
+        stress = dict(STRESS).get(st.get("stress"), "")
+        ops = dict(OPS).get(st.get("ops"), "—")
+        await query.answer("Збережено 👍")
+        await query.edit_message_text(
+            f"📋 День {date[8:]}.{date[5:7]} — {done}/{len(CHECK_ITEMS)}\n\n" + "\n".join(lines) +
+            f"\n\nНастрій {mood} · Стрес {stress} · Операцій: {ops}\n🔥 Серія чек-інів: {checkin_streak()} дн."
+        )
+        return
+    else:
+        st[field] = None if st.get(field) == val else val
+        if st[field] is None:
+            st.pop(field)
+    save_checkin(date, st)
+    await query.answer()
+    await query.edit_message_text(checkin_text(date, st), reply_markup=checkin_keyboard(date, st))
+
+async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != DOCTOR_ID:
+        return
+    await send_evening_checkin(context.application)
 
 async def send_night_question(app):
     await app.bot.send_message(
@@ -765,6 +861,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.data.startswith("ci:"):
+        if query.from_user.id == DOCTOR_ID:
+            await handle_checkin_callback(query)
+        else:
+            await query.answer()
+        return
     await query.answer()
     if query.data == "record":
         await query.message.reply_text(
@@ -785,6 +887,7 @@ async def post_init(app):
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("checkin", cmd_checkin))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
