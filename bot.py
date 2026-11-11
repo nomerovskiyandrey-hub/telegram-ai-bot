@@ -8,7 +8,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CallbackQueryHandler, CommandHandler
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
@@ -48,10 +48,10 @@ def init_db():
         id INTEGER PRIMARY KEY CHECK (id = 1),
         memory TEXT DEFAULT ''
     )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS checkins (
-        date TEXT PRIMARY KEY,
-        state TEXT DEFAULT '{}',
-        done INTEGER DEFAULT 0
+    c.execute("""CREATE TABLE IF NOT EXISTS relay (
+        doctor_msg_id INTEGER PRIMARY KEY,
+        chat_id INTEGER,
+        business_id TEXT
     )""")
     # Міграція: додати long_memory якщо не існує
     try:
@@ -148,7 +148,9 @@ SYSTEM_PROMPT = """Ти — розумний персональний асист
 ### 🏥 ПАЦІЄНТ (медичне питання, запис, симптоми, операція):
 - Представляйся: "Асистент лікаря Андрія Ігоровича Номеровського"
 - Медичний тон, тепло, по суті
-- Завжди пропонуй записатись
+- Запис пропонуй м'яко і доречно: одним коротким реченням в кінці, коли є скарга, знімки чи питання про операцію. Не повторюй, якщо вже пропонував у цій розмові, якщо пацієнт уже записаний або просто дякує
+- Ординаторська — це тільки орієнтир адреси. НІКОЛИ не кажи пацієнту заходити в ординаторську чи чекати там — лікаря може не бути на місці. Кажи, що Андрій Ігорович вийде і зустріне
+- Якщо пацієнт пише, що вже прийшов / на місці / чекає — відповідай тільки: "Андрій Ігорович підійде і зустріне вас за пару хвилин." Не відправляй його нікуди і не давай адрес
 
 ### 👥 ДРУГ/ЗНАЙОМИЙ (неформальне спілкування, особисті теми):
 - НЕ представляйся як асистент
@@ -273,31 +275,6 @@ SYSTEM_PROMPT = """Ти — розумний персональний асист
 - Запам'ятовуй ім'я і звертайся по імені
 - Тон: теплий, природний, без зайвих слів"""
 
-DOCTOR_SYSTEM_PROMPT = """Ти — особистий AI-асистент Андрія Номеровського, лікаря ортопеда-травматолога з Одеси.
-
-## ХТО ТАКИЙ АНДРІЙ
-- Ортопед-травматолог, спеціалізація: ендопротезування кульшового та колінного суглобів
-- Працює в МКЛ №11 (державна) і клініці Onemed (приватна)
-- Мета: 10-13 ендопротезів/місяць, дохід 8-10k$/міс
-- Зараз дохід ~2-3k$/міс
-- Двоє дітей: Міша (5 років) і Святослав (7 місяців)
-- 6 місяців без шкідливих звичок
-
-## 3 ЯКОРІ ДНЯ
-- 🌅 Ранок: 10 хв руху + вода + 1 ціль дня
-- 💰 День: фіксувати кожну витрату
-- ❤️ Вечір: одна тепла дія для дружини
-
-## СТИЛЬ
-- Коротко і по суті — Андрій цінує час
-- Мотивуй через результат і гроші
-- Звертайся на "ти"
-- Відповідай мовою на якій пише (укр або рос)
-- Допомагай з: плануванням дня, написанням сторіс для Instagram, аналізом ситуацій, медичними питаннями по спеціальності
-
-## ДОВГА ПАМ'ЯТЬ
-{long_memory}"""
-
 # ─────────────────────────────────────────────
 # 🛠️ УТИЛІТИ
 # ─────────────────────────────────────────────
@@ -385,30 +362,6 @@ async def transcribe_voice(file_bytes: bytes, mime_type: str = "audio/ogg") -> s
     return response.content[0].text.strip()
 
 # ─────────────────────────────────────────────
-# 🧠 ДОВГА ПАМ'ЯТЬ ЛІКАРЯ
-# ─────────────────────────────────────────────
-
-async def update_doctor_memory(new_message: str, reply: str, current_memory: str) -> str:
-    """Оновлює довгу пам'ять після кожного діалогу з лікарем."""
-    response = await anthropic_client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=800,
-        messages=[{
-            "role": "user",
-            "content": f"""Поточна пам'ять:
-{current_memory}
-
-Новий діалог:
-Андрій: {new_message}
-Асистент: {reply}
-
-Онови пам'ять — додай важливі факти, рішення, плани. Видали застарілу інформацію.
-Формат: короткі пункти. Максимум 30 рядків. Тільки факти про Андрія."""
-        }]
-    )
-    return response.content[0].text.strip()
-
-# ─────────────────────────────────────────────
 # 📊 ЗВІТИ
 # ─────────────────────────────────────────────
 
@@ -425,147 +378,6 @@ async def send_daily_report(app):
     clear_requests()
 
 # ─────────────────────────────────────────────
-# ⏰ ЩОДЕННІ ПОВІДОМЛЕННЯ
-# ─────────────────────────────────────────────
-
-async def send_morning_question(app):
-    await app.bot.send_message(
-        chat_id=DOCTOR_ID,
-        text=(
-            "🌅 Андрій, доброго ранку.\n\n"
-            "🎯 *Ціль дня* — одне найважливіше:\n\n"
-            "📋 *Задачі:*\n"
-            "— Сьогодні:\n"
-            "— Завтра:\n\n"
-            "📱 *Сторис на сьогодні* — яка тема?\n\n"
-            "💡 Нагадую: *10-13 ендопротезів/місяць.* Що сьогодні наближає тебе до неї?"
-        ),
-        parse_mode="Markdown"
-    )
-
-# ── ✅ Інтерактивний вечірній чек-ін (кнопки, редагується на місці) ──
-
-CHECK_ITEMS = [
-    ("move", "🏃 Рух 10 хв"),
-    ("water", "💧 Вода зранку"),
-    ("spend", "💸 Витрати записав"),
-    ("story", "📱 Сторис вийшла"),
-    ("wife", "❤️ Тепла дія дружині"),
-    ("misha", "📖 Міша: 15 хв / книжка"),
-    ("sviat", "👶 Час зі Святославом"),
-]
-MOOD = [("1", "😩"), ("2", "😐"), ("3", "🙂"), ("4", "🔥")]
-STRESS = [("1", "🧊 спокій"), ("2", "🌤 помірно"), ("3", "⚡ напруга"), ("4", "🌋 перегрів")]
-OPS = [("0", "0"), ("1", "1"), ("2", "2"), ("3", "3+")]
-
-def _today():
-    return datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
-
-def get_checkin(date):
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT state, done FROM checkins WHERE date=?", (date,)).fetchone()
-    conn.close()
-    return (json.loads(row[0]), bool(row[1])) if row else ({}, False)
-
-def save_checkin(date, state, done=False):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT OR REPLACE INTO checkins (date, state, done) VALUES (?, ?, ?)",
-                 (date, json.dumps(state, ensure_ascii=False), int(done)))
-    conn.commit()
-    conn.close()
-
-def checkin_streak():
-    conn = sqlite3.connect(DB_PATH)
-    dates = {r[0] for r in conn.execute("SELECT date FROM checkins WHERE done=1")}
-    conn.close()
-    streak, day = 0, datetime.now(KYIV_TZ).date()
-    from datetime import timedelta
-    while day.isoformat() in dates:
-        streak += 1
-        day -= timedelta(days=1)
-    return streak
-
-def checkin_keyboard(date, st):
-    rows, pair = [], []
-    for key, label in CHECK_ITEMS:
-        mark = "✅" if st.get(key) else "⬜"
-        pair.append(InlineKeyboardButton(f"{mark} {label}", callback_data=f"ci:{date}:t:{key}"))
-        if len(pair) == 2:
-            rows.append(pair); pair = []
-    if pair:
-        rows.append(pair)
-    def radio(field, opts, title):
-        rows.append([InlineKeyboardButton(title, callback_data="ci:noop")])
-        rows.append([InlineKeyboardButton(("● " if st.get(field) == v else "") + lbl,
-                                          callback_data=f"ci:{date}:{field}:{v}") for v, lbl in opts])
-    radio("mood", MOOD, "— Настрій —")
-    radio("stress", STRESS, "— Стрес —")
-    radio("ops", OPS, "— Операцій сьогодні —")
-    rows.append([InlineKeyboardButton("💾 Готово", callback_data=f"ci:{date}:done:1")])
-    return InlineKeyboardMarkup(rows)
-
-def checkin_text(date, st):
-    done = sum(1 for k, _ in CHECK_ITEMS if st.get(k))
-    return f"📋 Підсумок дня {date[8:]}.{date[5:7]} — тапай, що було.\nВиконано: {done}/{len(CHECK_ITEMS)}"
-
-async def send_evening_checkin(app):
-    date = _today()
-    st, _ = get_checkin(date)
-    await app.bot.send_message(chat_id=DOCTOR_ID, text=checkin_text(date, st),
-                               reply_markup=checkin_keyboard(date, st))
-
-async def handle_checkin_callback(query):
-    parts = query.data.split(":")
-    if len(parts) < 4:
-        await query.answer()
-        return
-    _, date, field, val = parts
-    st, _ = get_checkin(date)
-    if field == "t":
-        st[val] = not st.get(val)
-    elif field == "done":
-        missing = [n for f, n in (("mood", "настрій"), ("stress", "стрес")) if f not in st]
-        if missing:
-            await query.answer("Ще: " + ", ".join(missing), show_alert=False)
-            return
-        save_checkin(date, st, done=True)
-        done = sum(1 for k, _ in CHECK_ITEMS if st.get(k))
-        lines = [f"{'✅' if st.get(k) else '❌'} {lbl}" for k, lbl in CHECK_ITEMS]
-        mood = dict(MOOD).get(st.get("mood"), "")
-        stress = dict(STRESS).get(st.get("stress"), "")
-        ops = dict(OPS).get(st.get("ops"), "—")
-        await query.answer("Збережено 👍")
-        await query.edit_message_text(
-            f"📋 День {date[8:]}.{date[5:7]} — {done}/{len(CHECK_ITEMS)}\n\n" + "\n".join(lines) +
-            f"\n\nНастрій {mood} · Стрес {stress} · Операцій: {ops}\n🔥 Серія чек-інів: {checkin_streak()} дн."
-        )
-        return
-    else:
-        st[field] = None if st.get(field) == val else val
-        if st[field] is None:
-            st.pop(field)
-    save_checkin(date, st)
-    await query.answer()
-    await query.edit_message_text(checkin_text(date, st), reply_markup=checkin_keyboard(date, st))
-
-async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != DOCTOR_ID:
-        return
-    await send_evening_checkin(context.application)
-
-async def send_night_question(app):
-    await app.bot.send_message(
-        chat_id=DOCTOR_ID,
-        text=(
-            "🌙 Перед сном — три питання:\n\n"
-            "💡 *Головний інсайт дня* — що зрозумів?\n\n"
-            "📋 *Завтра* — що найважливіше?\n\n"
-            "✨ *Що сьогодні було твоїм — навіть маленьким?*"
-        ),
-        parse_mode="Markdown"
-    )
-
-# ─────────────────────────────────────────────
 # ⏰ ПЛАНУВАЛЬНИК
 # ─────────────────────────────────────────────
 
@@ -574,82 +386,124 @@ async def schedule_reports(app):
     while True:
         now = datetime.now(KYIV_TZ)
         date_str = now.strftime("%Y-%m-%d")
-
-        if now.hour == 7 and now.minute == 0:
-            key = f"{date_str}_morning"
-            if last_report_key != key:
-                await send_morning_question(app)
-                last_report_key = key
-
-        if now.hour == 8 and now.minute == 0:
-            key = f"{date_str}_report_morning"
-            if last_report_key != key:
-                await send_daily_report(app)
-                last_report_key = key
-
-        if now.hour == 19 and now.minute == 0:
-            key = f"{date_str}_checkin"
-            if last_report_key != key:
-                await send_evening_checkin(app)
-                last_report_key = key
-
-        if now.hour == 20 and now.minute == 0:
-            key = f"{date_str}_report_evening"
-            if last_report_key != key:
-                await send_daily_report(app)
-                last_report_key = key
-
-        if now.hour == 21 and now.minute == 0:
-            key = f"{date_str}_night"
-            if last_report_key != key:
-                await send_night_question(app)
-                last_report_key = key
-
+        for hour, name in ((8, "morning"), (20, "evening")):
+            if now.hour == hour and now.minute == 0:
+                key = f"{date_str}_report_{name}"
+                if last_report_key != key:
+                    await send_daily_report(app)
+                    last_report_key = key
         await asyncio.sleep(30)
 
 # ─────────────────────────────────────────────
-# 👨‍⚕️ ОБРОБКА ПОВІДОМЛЕНЬ ЛІКАРЯ
+# 🔁 ВІДПОВІДІ ЛІКАРЯ ПАЦІЄНТАМ ЧЕРЕЗ БОТА
 # ─────────────────────────────────────────────
 
-async def process_doctor_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Відповідає лікарю як особистий асистент з довгою пам'яттю."""
-    current_memory = get_doctor_memory()
+DOCTOR_PAUSE_SEC = 3600       # після ручної відповіді лікаря бот мовчить у цьому чаті 1 год
+PHOTO_ACK_COOLDOWN = 600      # одне "отримали знімки" на 10 хв
+DEBOUNCE_SEC = 8              # збираємо кілька повідомлень підряд в одну відповідь
 
-    system = DOCTOR_SYSTEM_PROMPT.format(
-        long_memory=current_memory if current_memory else "Поки що порожньо — пам'ять заповнюється з часом."
+doctor_active = {}            # chat_id -> timestamp останньої відповіді лікаря
+photo_ack = {}                # chat_id -> timestamp останнього підтвердження фото
+seen_media_groups = set()
+record_offer = {}             # chat_id -> коли востаннє показали кнопку запису
+pending = {}                  # chat_id -> {"texts": [...], "message": msg, "task": task}
+
+def _now():
+    return datetime.now(KYIV_TZ).timestamp()
+
+def mark_doctor_active(chat_id):
+    doctor_active[chat_id] = _now()
+    p = pending.pop(chat_id, None)
+    if p and p.get("task"):
+        p["task"].cancel()
+
+def is_doctor_active(chat_id):
+    return _now() - doctor_active.get(chat_id, 0) < DOCTOR_PAUSE_SEC
+
+def save_relay(doctor_msg_id, chat_id, business_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR REPLACE INTO relay VALUES (?, ?, ?)", (doctor_msg_id, chat_id, business_id))
+    conn.commit()
+    conn.close()
+
+def get_relay(doctor_msg_id):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT chat_id, business_id FROM relay WHERE doctor_msg_id=?", (doctor_msg_id,)).fetchone()
+    conn.close()
+    return row
+
+def add_history(chat_id, role, text):
+    patient = get_patient(chat_id)
+    patient["history"].append({"role": role, "content": text})
+    patient["history"] = patient["history"][-30:]
+    save_patient(chat_id, patient)
+
+async def notify_doctor(bot, chat_id, business_id, text):
+    """Картка лікарю; відповідь реплаєм на неї піде пацієнту."""
+    try:
+        msg = await bot.send_message(chat_id=DOCTOR_ID, text=text[:4000])
+        save_relay(msg.message_id, chat_id, business_id)
+    except Exception as e:
+        print(f"notify_doctor failed: {e}")
+
+async def send_to_patient(bot, chat_id, business_id, text, reply_markup=None):
+    return await bot.send_message(
+        chat_id=chat_id, text=text,
+        reply_markup=reply_markup if not business_id else None,
+        business_connection_id=business_id,
     )
 
-    try:
-        response = await anthropic_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1000,
-            system=system,
-            messages=[{"role": "user", "content": text}]
+async def process_doctor_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Лікар відповідає реплаєм на картку пацієнта — бот пересилає відповідь пацієнту."""
+    message = update.message or update.business_message
+    reply_to = message.reply_to_message if message else None
+    relay = get_relay(reply_to.message_id) if reply_to else None
+    if not relay:
+        await context.bot.send_message(
+            chat_id=DOCTOR_ID,
+            text="Щоб відповісти пацієнту — свайпни вліво по його картці чи фото і напиши або надиктуй відповідь."
         )
-        reply = response.content[0].text
-    except Exception as e:
-        await context.bot.send_message(chat_id=DOCTOR_ID, text=f"⚠️ Помилка Claude: {e}")
         return
-
-    await context.bot.send_message(chat_id=DOCTOR_ID, text=reply)
-
-    # Оновлюємо довгу пам'ять асинхронно
+    chat_id, business_id = relay
     try:
-        new_memory = await update_doctor_memory(text, reply, current_memory)
-        save_doctor_memory(new_memory)
-    except Exception:
-        pass
+        await send_to_patient(context.bot, chat_id, business_id, text)
+    except Exception as e:
+        await context.bot.send_message(chat_id=DOCTOR_ID, text=f"⚠️ Не вдалось надіслати: {e}")
+        return
+    mark_doctor_active(chat_id)
+    add_history(chat_id, "assistant", text)
+    name = get_patient(chat_id).get("name") or chat_id
+    await context.bot.send_message(chat_id=DOCTOR_ID, text=f"✅ Надіслано: {name}")
+
+# ─────────────────────────────────────────────
+# 🚶 ПАЦІЄНТ ПРИЙШОВ
+# ─────────────────────────────────────────────
+
+ARRIVAL_PATTERNS = [
+    "я прийшов", "я прийшла", "я прийшли", "ми прийшли", "вже прийшов", "вже прийшла", "вже на місці",
+    "я на місці", "ми на місці", "я тут", "ми тут", "я під", "я біля", "чекаю біля", "чекаю під", "чекаю в коридорі",
+    "я пришел", "я пришла", "мы пришли", "уже пришел", "уже пришла", "я на месте", "мы на месте", "уже на месте",
+    "я под", "я возле", "я у кабинета", "жду у", "жду возле", "жду под", "жду в коридоре", "я в коридоре", "я в коридорі",
+    "я приїхав", "я приїхала", "я приехал", "я приехала", "мы приехали", "ми приїхали",
+]
+
+def is_arrival(text):
+    t = " " + text.lower().replace("ё", "е") + " "
+    return any(p in t for p in ARRIVAL_PATTERNS)
+
+def arrival_reply(text):
+    ru = any(ch in text.lower() for ch in "ыэё") or any(w in text.lower() for w in ("пришел", "пришла", "приехал", "жду", "месте"))
+    return ("Андрей Игоревич подойдёт и встретит вас через пару минут." if ru
+            else "Андрій Ігорович підійде і зустріне вас за пару хвилин.")
 
 # ─────────────────────────────────────────────
 # 🏥 ОБРОБКА ПОВІДОМЛЕНЬ ПАЦІЄНТІВ
 # ─────────────────────────────────────────────
 
-async def process_patient_message(update: Update, context: ContextTypes.DEFAULT_TYPE, message, text: str):
+async def queue_patient_text(context, message, text: str):
+    """Фільтри + склеювання кількох повідомлень поспіль в одну відповідь."""
     chat_id = message.chat.id
-
-    if is_blacklisted(chat_id):
-        return
-    if is_only_emoji(text):
+    if is_blacklisted(chat_id) or is_only_emoji(text):
         return
     if is_spam(text):
         add_blacklist(chat_id)
@@ -657,18 +511,59 @@ async def process_patient_message(update: Update, context: ContextTypes.DEFAULT_
     if is_flood(chat_id):
         return
 
+    business_id = getattr(message, "business_connection_id", None)
     patient = get_patient(chat_id)
+    name = patient.get("name") or "Пацієнт"
+    contact = await get_contact_info(message)
 
-    # Термінове повідомлення лікарю
-    if is_urgent(text) and not check_urgent_cooldown(chat_id):
-        contact = await get_contact_info(message)
-        name = patient.get('name') or 'Невідомий'
-        await context.bot.send_message(
-            chat_id=DOCTOR_ID,
-            text=f"🚨 ТЕРМІНОВО!\nПацієнт: {name}\nКонтакт: {contact}\nПише: {text}"
-        )
+    if is_arrival(text):
+        p = pending.pop(chat_id, None)
+        if p and p.get("task"):
+            p["task"].cancel()
+        reply = arrival_reply(text)
+        if not is_doctor_active(chat_id):
+            await send_to_patient(context.bot, chat_id, business_id, reply)
+            add_history(chat_id, "user", text)
+            add_history(chat_id, "assistant", reply)
+        await notify_doctor(context.bot, chat_id, business_id,
+                            f"🚶 ПАЦІЄНТ ПРИЙШОВ — {name} ({contact})\n«{text}»\n\nВідповіли: «{reply}»")
+        add_request(f"🚶 Прийшов: {name} ({contact})")
+        return
 
-    # Системний промпт з довгою пам'яттю пацієнта
+    if is_doctor_active(chat_id):
+        add_history(chat_id, "user", text)
+        await notify_doctor(context.bot, chat_id, business_id,
+                            f"💬 {name} ({contact}):\n{text}\n\n🤫 Бот мовчить — ти зараз ведеш цей чат. ↩️ Реплай = відповідь пацієнту")
+        return
+
+    p = pending.setdefault(chat_id, {"texts": []})
+    p["texts"].append(text)
+    p["message"] = message
+    if p.get("task"):
+        p["task"].cancel()
+    p["task"] = asyncio.create_task(_flush_patient(chat_id, context))
+
+async def _flush_patient(chat_id, context):
+    try:
+        await asyncio.sleep(DEBOUNCE_SEC)
+    except asyncio.CancelledError:
+        return
+    p = pending.pop(chat_id, None)
+    if not p or not p["texts"]:
+        return
+    try:
+        await process_patient_message(None, context, p["message"], "\n".join(p["texts"]))
+    except Exception as e:
+        print(f"process_patient_message failed for {chat_id}: {e}")
+
+async def process_patient_message(update, context: ContextTypes.DEFAULT_TYPE, message, text: str):
+    chat_id = message.chat.id
+    business_id = getattr(message, "business_connection_id", None)
+    patient = get_patient(chat_id)
+    contact = await get_contact_info(message)
+
+    urgent = is_urgent(text) and not check_urgent_cooldown(chat_id)
+
     system = SYSTEM_PROMPT
     if patient.get("long_memory"):
         system += f"\n\n## ПАМ'ЯТЬ ПРО ЦЬОГО ПАЦІЄНТА\n{patient['long_memory']}"
@@ -680,28 +575,23 @@ async def process_patient_message(update: Update, context: ContextTypes.DEFAULT_
             model="claude-sonnet-4-6",
             max_tokens=1000,
             system=system,
-            messages=patient["history"][-10:]
+            messages=_clean_history(patient["history"][-10:])
         )
         reply = response.content[0].text
     except Exception as e:
-        await context.bot.send_message(
-            chat_id=DOCTOR_ID,
-            text=f"⚠️ Помилка Claude для чату {chat_id}: {e}"
-        )
-        reply = "Дякую, повідомлення отримали. Андрій Ігорович перегляне і зв'яжеться з вами."
+        await context.bot.send_message(chat_id=DOCTOR_ID, text=f"⚠️ Помилка Claude для чату {chat_id}: {e}")
+        reply = "Дякуємо, повідомлення отримали. Андрій Ігорович перегляне і зв'яжеться з вами."
 
     patient["history"].append({"role": "assistant", "content": reply})
     patient["history"] = patient["history"][-30:]
 
-    # Витягуємо ім'я пацієнта
     if not patient.get("name"):
         words = text.split()
         for i, word in enumerate(words):
             if word.lower() in ["мене", "я", "меня"] and i + 1 < len(words):
-                patient["name"] = words[i + 1].capitalize()
+                patient["name"] = words[i + 1].strip(",.!").capitalize()
                 break
 
-    # Оновлюємо довгу пам'ять пацієнта кожні 10 повідомлень
     if len(patient["history"]) % 10 == 0:
         try:
             mem_response = await anthropic_client.messages.create(
@@ -718,23 +608,35 @@ async def process_patient_message(update: Update, context: ContextTypes.DEFAULT_
 
     save_patient(chat_id, patient)
 
-    keyboard = [[
-        InlineKeyboardButton("📅 Записатись", callback_data="record"),
-        InlineKeyboardButton("📍 Адреса", callback_data="address"),
-    ]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # Кнопку "Записатись" показуємо не частіше ніж раз на добу в чаті
+    buttons = [InlineKeyboardButton("📍 Адреса", callback_data="address")]
+    if _now() - record_offer.get(chat_id, 0) > 24 * 3600:
+        record_offer[chat_id] = _now()
+        buttons.insert(0, InlineKeyboardButton("📅 Записатись", callback_data="record"))
+    keyboard = InlineKeyboardMarkup([buttons])
+    await send_to_patient(context.bot, chat_id, business_id, reply, keyboard)
 
-    business_id = getattr(message, 'business_connection_id', None)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=reply,
-        reply_markup=reply_markup if not business_id else None,
-        business_connection_id=business_id
-    )
-
-    contact = await get_contact_info(message)
-    name = patient.get("name") or str(chat_id)
+    name = patient.get("name") or "Пацієнт"
+    head = "🚨 ТЕРМІНОВО!\n" if urgent else ""
+    await notify_doctor(context.bot, chat_id, business_id,
+                        f"{head}💬 {name} ({contact}):\n{text}\n\n🤖 Бот відповів:\n{reply[:500]}\n\n↩️ Реплай = твоя відповідь пацієнту")
     add_request(f"👤 {name} ({contact}): {text[:60]}")
+
+def _clean_history(history):
+    """Anthropic вимагає чергування ролей і старт з user — склеюємо підряд однакові."""
+    out = []
+    for m in history:
+        if out and out[-1]["role"] == m["role"]:
+            out[-1] = {"role": m["role"], "content": out[-1]["content"] + "\n" + m["content"]}
+        else:
+            out.append(dict(m))
+    while out and out[0]["role"] != "user":
+        out.pop(0)
+    return out
+
+def is_owner_in_patient_chat(message):
+    """Андрій сам пише пацієнту зі свого акаунта (Telegram Business)."""
+    return (message.from_user and message.from_user.id == DOCTOR_ID and message.chat.id != DOCTOR_ID)
 
 # ─────────────────────────────────────────────
 # 📨 ХЕНДЛЕРИ
@@ -742,136 +644,106 @@ async def process_patient_message(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.business_message
-    if not message or not message.text:
+    if not message or not message.text or not message.from_user:
         return
-    if not message.from_user:
-        return
-    if message.from_user.is_bot:
-        return
-    if message.from_user.id == context.bot.id:
+    if message.from_user.is_bot or message.from_user.id == context.bot.id:
         return
 
-    chat_id = message.chat.id
-    text = message.text
-
-    # Лікар пише — відповідаємо як особистий асистент
-    if chat_id == DOCTOR_ID:
-        await process_doctor_message(update, context, text)
+    if is_owner_in_patient_chat(message):
+        mark_doctor_active(message.chat.id)
+        add_history(message.chat.id, "assistant", message.text)
         return
 
-    # Пацієнт пише
-    await process_patient_message(update, context, message, text)
+    if message.chat.id == DOCTOR_ID:
+        await process_doctor_message(update, context, message.text)
+        return
+
+    await queue_patient_text(context, message, message.text)
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробляє голосові повідомлення."""
     message = update.message or update.business_message
-    if not message:
+    if not message or not message.from_user:
         return
-
-    chat_id = message.chat.id
     voice = message.voice or message.audio
-
     if not voice:
         return
+    chat_id = message.chat.id
 
-    # Повідомлення що обробляємо
-    processing_msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text="🎙️ Обробляю голосове повідомлення..."
-    )
+    if is_owner_in_patient_chat(message):
+        mark_doctor_active(chat_id)
+        return
+    if chat_id != DOCTOR_ID and is_blacklisted(chat_id):
+        return
 
     try:
-        # Завантажуємо файл
         file = await context.bot.get_file(voice.file_id)
         file_bytes = await file.download_as_bytearray()
-
-        # Транскрибуємо
-        transcribed_text = await transcribe_voice(bytes(file_bytes))
-
-        # Видаляємо повідомлення "обробляю"
-        await processing_msg.delete()
-
-        if chat_id == DOCTOR_ID:
-            # Лікарю показуємо транскрипцію і відповідаємо
-            await context.bot.send_message(
-                chat_id=DOCTOR_ID,
-                text=f"🎙️ _Розпізнано:_ {transcribed_text}",
-                parse_mode="Markdown"
-            )
-            await process_doctor_message(update, context, transcribed_text)
-        else:
-            # Пацієнту — обробляємо як текст
-            if not is_blacklisted(chat_id) and not is_spam(transcribed_text):
-                await process_patient_message(update, context, message, transcribed_text)
-
+        text = await transcribe_voice(bytes(file_bytes))
     except Exception as e:
-        await processing_msg.delete()
         if chat_id == DOCTOR_ID:
-            await context.bot.send_message(
-                chat_id=DOCTOR_ID,
-                text=f"⚠️ Не вдалось розпізнати голосове: {e}"
-            )
+            await context.bot.send_message(chat_id=DOCTOR_ID, text=f"⚠️ Не вдалось розпізнати голосове: {e}")
         else:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Вибачте, не вдалось розпізнати голосове повідомлення. Напишіть текстом, будь ласка."
-            )
+            await notify_doctor(context.bot, chat_id, getattr(message, "business_connection_id", None),
+                                f"🎙️ Голосове від {get_patient(chat_id).get('name') or 'пацієнта'} ({await get_contact_info(message)}) — не розпізнано, послухай сам")
+        return
+
+    if chat_id == DOCTOR_ID:
+        await context.bot.send_message(chat_id=DOCTOR_ID, text=f"🎙️ {text}")
+        await process_doctor_message(update, context, text)
+    else:
+        await queue_patient_text(context, message, text)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.business_message
     if not message:
         return
     chat_id = message.chat.id
+    if is_owner_in_patient_chat(message):
+        mark_doctor_active(chat_id)
+        return
     if is_blacklisted(chat_id) or chat_id == DOCTOR_ID:
         return
 
+    business_id = getattr(message, "business_connection_id", None)
     patient = get_patient(chat_id)
     name = patient.get("name", "")
-    greeting = f"{name}, д" if name else "Д"
-    business_id = getattr(message, 'business_connection_id', None)
+    contact = await get_contact_info(message)
 
-    keyboard = [[
-        InlineKeyboardButton("📅 Записатись", callback_data="record"),
-        InlineKeyboardButton("📍 Адреса", callback_data="address"),
-    ]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"{greeting}якую отримали ваші знімки. Андрій Ігорович розгляне і зв'яжеться найближчим часом.\n\nЯкщо терміново — зателефонуйте: 0673283276",
-        reply_markup=reply_markup if not business_id else None,
-        business_connection_id=business_id
-    )
+    # Одне підтвердження на альбом і не частіше ніж раз на 10 хв
+    group = message.media_group_id
+    first_of_group = not group or group not in seen_media_groups
+    if group:
+        if len(seen_media_groups) > 1000:
+            seen_media_groups.clear()
+        seen_media_groups.add(group)
+    need_ack = (first_of_group and not is_doctor_active(chat_id)
+                and _now() - photo_ack.get(chat_id, 0) > PHOTO_ACK_COOLDOWN)
+    if need_ack:
+        photo_ack[chat_id] = _now()
+        greeting = f"{name}, д" if name else "Д"
+        ack = f"{greeting}якуємо, знімки отримали. Андрій Ігорович перегляне і напише вам.\n\nЯкщо терміново — 0673283276"
+        await send_to_patient(context.bot, chat_id, business_id, ack)
+        add_history(chat_id, "user", "[надіслав фото/документи]" + (f" {message.caption}" if message.caption else ""))
+        add_history(chat_id, "assistant", ack)
 
     try:
-        await context.bot.forward_message(
-            chat_id=DOCTOR_ID,
-            from_chat_id=chat_id,
-            message_id=message.message_id
-        )
+        fwd = await context.bot.forward_message(chat_id=DOCTOR_ID, from_chat_id=chat_id, message_id=message.message_id)
+        save_relay(fwd.message_id, chat_id, business_id)
     except Exception:
-        contact = await get_contact_info(message)
-        await context.bot.send_message(
-            chat_id=DOCTOR_ID,
-            text=f"📷 {name or chat_id} ({contact}) надіслав фото — переслати вручну"
-        )
-
-    contact = await get_contact_info(message)
-    add_request(f"📷 Фото від {name or chat_id} ({contact})")
+        try:
+            cp = await context.bot.send_photo(chat_id=DOCTOR_ID, photo=message.photo[-1].file_id,
+                                              caption=f"📷 {name or 'Пацієнт'} ({contact})\n↩️ Реплай = відповідь пацієнту")
+            save_relay(cp.message_id, chat_id, business_id)
+        except Exception:
+            await notify_doctor(context.bot, chat_id, business_id, f"📷 {name or chat_id} ({contact}) надіслав фото")
+    if first_of_group:
+        add_request(f"📷 Фото від {name or chat_id} ({contact})")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.data.startswith("ci:"):
-        if query.from_user.id == DOCTOR_ID:
-            await handle_checkin_callback(query)
-        else:
-            await query.answer()
-        return
     await query.answer()
     if query.data == "record":
-        await query.message.reply_text(
-            "Для запису зателефонуйте: 0673283276\nАбо напишіть зручний час — я передам лікарю."
-        )
+        await query.message.reply_text("Для запису зателефонуйте: 0673283276\nАбо напишіть зручний час — я передам лікарю.")
     elif query.data == "address":
         await query.message.reply_text(
             "📍 МКЛ №11: вул. Нестеренка, 5а — 8 корпус, 1 поверх, ліве крило\n\n📍 Onemed: вул. Якова Бреуса, 26/2"
@@ -887,7 +759,6 @@ async def post_init(app):
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("checkin", cmd_checkin))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
